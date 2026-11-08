@@ -1,0 +1,164 @@
+"""
+Analog gauge reading with YOLO-pose (Ultralytics).
+pip install ultralytics opencv-python
+
+Pipeline:
+  1. A YOLO pose model detects each gauge and 4 keypoints:
+       0 = dial center (needle pivot)
+       1 = needle tip
+       2 = min scale mark
+       3 = max scale mark
+  2. Geometry converts the needle angle into a value.
+
+---------------------------------------------------------------
+DATASET (YOLO pose format), file: gauges.yaml
+---------------------------------------------------------------
+path: datasets/gauges
+train: images/train
+val: images/val
+kpt_shape: [4, 3]          # 4 keypoints, (x, y, visibility)
+flip_idx: [0, 1, 2, 3]
+names:
+  0: gauge
+
+Each label .txt line (all values normalized 0-1):
+  class cx cy w h  x0 y0 v0  x1 y1 v1  x2 y2 v2  x3 y3 v3
+
+Label with CVAT, Label Studio or Roboflow (all export YOLO pose format).
+A few hundred labeled images from your own factory cameras is a good start.
+
+IMPORTANT: disable horizontal flip augmentation. A mirrored gauge turns
+clockwise into counter-clockwise and teaches the model wrong geometry.
+---------------------------------------------------------------
+"""
+
+import math
+import sys
+
+import cv2
+from ultralytics import YOLO
+
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+def train():
+    model = YOLO("yolo11n-pose.pt")   # pretrained pose weights; use s/m for more accuracy
+    model.train(
+        data="gauges.yaml",
+        epochs=30,
+        imgsz=640,
+        fliplr=0.0,      # no horizontal flips (see note above)
+        degrees=10,      # small rotations are fine
+        mosaic=1.0,
+    )
+    # Best weights end up in runs/pose/train/weights/best.pt
+
+
+# ------------------------------------------------------------------
+# Geometry: keypoints -> value
+# ------------------------------------------------------------------
+def _angle_deg(center, point):
+    """Angle of point around center, degrees, standard math convention
+    (counter-clockwise positive). Image y points down, so flip it."""
+    dx = point[0] - center[0]
+    dy = center[1] - point[1]
+    return math.degrees(math.atan2(dy, dx)) % 360
+
+
+def _cw(from_deg, to_deg):
+    """Clockwise angle travelled from from_deg to to_deg (0-360)."""
+    return (from_deg - to_deg) % 360
+
+
+def read_value(center, tip, min_mark, max_mark, vmin, vmax):
+    """Linear gauge: value proportional to clockwise angle from the min mark."""
+    a_min = _angle_deg(center, min_mark)
+    a_max = _angle_deg(center, max_mark)
+    a_tip = _angle_deg(center, tip)
+
+    sweep = _cw(a_min, a_max)       # e.g. ~270 deg on a typical pressure gauge
+    needle = _cw(a_min, a_tip)
+
+    # Needle slightly below the min mark (in the dead zone) -> treat as negative
+    dead_zone = 360 - sweep
+    if needle > sweep + dead_zone / 2:
+        needle -= 360
+
+    frac = needle / sweep
+    return vmin + frac * (vmax - vmin)
+
+
+# ------------------------------------------------------------------
+# Inference
+# ------------------------------------------------------------------
+# Range per gauge. In a real deployment, map each camera/gauge ID to its range.
+GAUGE_MIN = 0.0
+GAUGE_MAX = 10.0
+UNIT = "bar"
+KPT_CONF = 0.5
+
+
+def process_frame(model, frame):
+    results = model(frame, verbose=False)[0]
+    if results.keypoints is None:
+        return frame
+
+    boxes = results.boxes.xyxy.cpu().numpy()
+    kpts = results.keypoints.xy.cpu().numpy()        # (N, 4, 2)
+    confs = results.keypoints.conf
+    confs = confs.cpu().numpy() if confs is not None else None
+
+    for i, (box, kp) in enumerate(zip(boxes, kpts)):
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        if confs is not None and confs[i].min() < KPT_CONF:
+            cv2.putText(frame, "low confidence", (x1, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            continue
+
+        center, tip, mn, mx = kp
+        value = read_value(center, tip, mn, mx, GAUGE_MIN, GAUGE_MAX)
+
+        # Draw needle and marks for visual checking
+        c = tuple(map(int, center))
+        cv2.line(frame, c, tuple(map(int, tip)), (0, 0, 255), 2)
+        for p, col in ((mn, (255, 0, 0)), (mx, (255, 0, 255))):
+            cv2.circle(frame, tuple(map(int, p)), 5, col, -1)
+
+        cv2.putText(frame, f"{value:.2f} {UNIT}", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    return frame
+
+
+def run(source, weights="runs/pose/train-5/weights/best.pt"):
+    model = YOLO(weights)
+
+    if str(source).lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+        frame = cv2.imread(source)
+        cv2.imwrite("gauge_result.jpg", process_frame(model, frame))
+        print("Saved gauge_result.jpg")
+        return
+
+    # Video file, webcam index, or RTSP stream from a factory camera
+    cap = cv2.VideoCapture(int(source) if str(source).isdigit() else source)
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cv2.imshow("Gauge reader", process_frame(model, frame))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    # python gauge_reader.py train
+    # python gauge_reader.py image.jpg
+    # python gauge_reader.py rtsp://camera-ip/stream
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        train()
+    else:
+        run(sys.argv[1] if len(sys.argv) > 1 else "0")
